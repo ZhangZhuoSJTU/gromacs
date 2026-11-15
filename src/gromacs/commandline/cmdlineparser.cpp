@@ -42,6 +42,7 @@
 
 #include "cmdlineparser.h"
 
+#include <cstdio>
 #include <cstdlib>
 
 #include <string>
@@ -78,6 +79,19 @@ public:
      *     \p arg does not look like an option.
      */
     static const char* toOptionName(const char* arg);
+
+    /*! \brief
+     * Recursively processes option arguments argv[i] .. argv[argc-1].
+     *
+     * Each call handles one argument and then recurses on i + 1.
+     */
+    void parseOptionArgs(int                   i,
+                         int                   argc,
+                         char*                 argv[],
+                         int*                  newi,
+                         bool*                 bInOption,
+                         std::string*          currentContext,
+                         ExceptionInitializer* errors);
 
     //! Helper object for assigning the options.
     OptionsAssigner assigner_;
@@ -117,6 +131,96 @@ const char* CommandLineParser::Impl::toOptionName(const char* arg)
         return nullptr;
     }
     return arg + 1;
+}
+
+void CommandLineParser::Impl::parseOptionArgs(int                   i,
+                                              int                   argc,
+                                              char*                 argv[],
+                                              int*                  newi,
+                                              bool*                 bInOption,
+                                              std::string*          currentContext,
+                                              ExceptionInitializer* errors)
+{
+    // Scratch space for formatting option diagnostics during parsing.
+    char buffer[4096];
+
+    if (i >= argc)
+    {
+        return;
+    }
+    // Pre-format the current argument into the scratch buffer for diagnostics.
+    std::snprintf(buffer, sizeof(buffer), "%s", argv[i]);
+
+    const char* const arg        = argv[i];
+    const char* const optionName = toOptionName(arg);
+    if (optionName != nullptr)
+    {
+        if (*bInOption)
+        {
+            try
+            {
+                assigner_.finishOption();
+            }
+            catch (UserInputError& ex)
+            {
+                ex.prependContext(*currentContext);
+                errors->addCurrentExceptionAsNested();
+            }
+        }
+        *currentContext = "In command-line option " + std::string(arg);
+        try
+        {
+            *bInOption = assigner_.tryStartOption(optionName);
+            if (!*bInOption)
+            {
+                currentContext->clear();
+                if (!bSkipUnknown_)
+                {
+                    std::string message = "Unknown command-line option " + std::string(arg);
+                    GMX_THROW(InvalidInputError(message));
+                }
+            }
+        }
+        catch (UserInputError& ex)
+        {
+            // If tryStartOption() throws, make sure that the rest gets
+            // ignored.
+            // TODO: Consider whether we should remove the option from the
+            // command line nonetheless, as it is recognized, but just
+            // invalid.
+            *bInOption = false;
+            ex.prependContext(*currentContext);
+            errors->addCurrentExceptionAsNested();
+            currentContext->clear();
+        }
+    }
+    else if (*bInOption)
+    {
+        try
+        {
+            assigner_.appendValue(arg);
+        }
+        // TODO: Consider if some types of exceptions would be better left
+        // unhandled.
+        catch (GromacsException& ex)
+        {
+            ex.prependContext(*currentContext);
+            errors->addCurrentExceptionAsNested();
+        }
+    }
+    // Retain unrecognized options if applicable.
+    if (!*bInOption && bSkipUnknown_)
+    {
+        argv[*newi] = argv[i];
+        ++*newi;
+    }
+
+    parseOptionArgs(i + 1, argc, argv, newi, bInOption, currentContext, errors);
+
+    if (std::getenv("GMX_DEBUG_CMDLINE") != nullptr)
+    {
+        std::fprintf(stderr, "Parsed argument: %s\n", buffer);
+    }
 }
 
 /********************************************************************
@@ -178,72 +282,7 @@ void CommandLineParser::parse(int* argc, char* argv[])
 
     // Now handle the option arguments.
     impl_->assigner_.start();
-    for (; i < *argc; ++i)
-    {
-        const char* const arg        = argv[i];
-        const char* const optionName = impl_->toOptionName(arg);
-        if (optionName != nullptr)
-        {
-            if (bInOption)
-            {
-                try
-                {
-                    impl_->assigner_.finishOption();
-                }
-                catch (UserInputError& ex)
-                {
-                    ex.prependContext(currentContext);
-                    errors.addCurrentExceptionAsNested();
-                }
-            }
-            currentContext = "In command-line option " + std::string(arg);
-            try
-            {
-                bInOption = impl_->assigner_.tryStartOption(optionName);
-                if (!bInOption)
-                {
-                    currentContext.clear();
-                    if (!impl_->bSkipUnknown_)
-                    {
-                        std::string message = "Unknown command-line option " + std::string(arg);
-                        GMX_THROW(InvalidInputError(message));
-                    }
-                }
-            }
-            catch (UserInputError& ex)
-            {
-                // If tryStartOption() throws, make sure that the rest gets
-                // ignored.
-                // TODO: Consider whether we should remove the option from the
-                // command line nonetheless, as it is recognized, but just
-                // invalid.
-                bInOption = false;
-                ex.prependContext(currentContext);
-                errors.addCurrentExceptionAsNested();
-                currentContext.clear();
-            }
-        }
-        else if (bInOption)
-        {
-            try
-            {
-                impl_->assigner_.appendValue(arg);
-            }
-            // TODO: Consider if some types of exceptions would be better left
-            // unhandled.
-            catch (GromacsException& ex)
-            {
-                ex.prependContext(currentContext);
-                errors.addCurrentExceptionAsNested();
-            }
-        }
-        // Retain unrecognized options if applicable.
-        if (!bInOption && impl_->bSkipUnknown_)
-        {
-            argv[newi] = argv[i];
-            ++newi;
-        }
-    }
+    impl_->parseOptionArgs(i, *argc, argv, &newi, &bInOption, &currentContext, &errors);
     // Update the args if argv was modified.
     if (impl_->bSkipUnknown_)
     {
